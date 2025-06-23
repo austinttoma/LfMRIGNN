@@ -46,11 +46,10 @@ class OptInit():
         args.time = datetime.datetime.now().strftime("%y%m%d")
 
         # Device configuration (GPU/CPU)
-        if args.use_cpu:
-            args.device = torch.device('cpu')
+        if not args.use_cpu and torch.cuda.is_available():
+            args.device = torch.device('cuda:0')
         else:
-            args.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-            print(" Using GPU in torch")
+            args.device = torch.device('cpu')
 
         self.args = args
 

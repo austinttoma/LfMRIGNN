@@ -59,6 +59,10 @@ if __name__ == '__main__':
             labels = torch.tensor(y, dtype=torch.long).to(opt.device)
             model = fc_hgnn(nonimg, phonetic_score, dl).to(opt.device)
 
+            # Pre-compute population graph edges once (does not depend on embeddings)
+            same_idx_np, diff_idx_np = dl.get_inputs(nonimg, torch.zeros((len(raw_features), 1)), phonetic_score)
+            model.set_population_edges(same_idx_np, diff_idx_np)
+
             # Compile the model if running on PyTorch 2.x for additional speed-ups
             try:
                 model = torch.compile(model)

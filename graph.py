@@ -56,6 +56,19 @@ def read_sigle_data(data):
     att_torch = torch.from_numpy(att).float()
     graph = Data(x=att_torch, edge_index=edge_index.long(), edge_attr=edge_att)
     
+    # ------------------------------------------------------------
+    # Pre-compute hemisphere sub-graphs so they don't need to be
+    # recomputed inside every forward pass on the GPU.
+    # ------------------------------------------------------------
+    left_mask  = (graph.edge_index[0] < 50) & (graph.edge_index[1] < 50)
+    right_mask = (graph.edge_index[0] >= 50) & (graph.edge_index[1] >= 50)
+
+    graph.left_edge_index = graph.edge_index[:, left_mask]
+    graph.left_edge_attr  = graph.edge_attr[left_mask]
+
+    graph.right_edge_index = graph.edge_index[:, right_mask]
+    graph.right_edge_attr  = graph.edge_attr[right_mask]
+    
     return graph
 
 def visualize_subject_graph(subject_id, kind='fc_matrix', variable='arr_0', save_plot=True):

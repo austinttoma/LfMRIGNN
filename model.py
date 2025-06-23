@@ -71,9 +71,18 @@ class Brain_connectomic_graph(torch.nn.Module):
         leftBrain = torch.tensor([i for i in range(50)], dtype=torch.float).to(opt.device)  # Regions 0-49
         rightBrain = torch.tensor([i for i in range(50, 100)], dtype=torch.float).to(opt.device)  # Regions 50-99
 
-        # Create hemisphere-specific subgraphs
-        new_left_edges,new_left_edge_attr = subgraph(subset=leftBrain.type(torch.long),edge_index=edges,edge_attr=edge_attr)
-        new_right_edges,new_right_edge_attr = subgraph(subset=rightBrain.type(torch.long), edge_index=edges, edge_attr=edge_attr)
+        # Create hemisphere-specific subgraphs (use precomputed indices if available)
+        if hasattr(data, 'left_edge_index') and data.left_edge_index.numel() > 0:
+            new_left_edges = data.left_edge_index.to(opt.device)
+            new_left_edge_attr = data.left_edge_attr.to(opt.device)
+        else:
+            new_left_edges, new_left_edge_attr = subgraph(subset=leftBrain.type(torch.long), edge_index=edges, edge_attr=edge_attr)
+
+        if hasattr(data, 'right_edge_index') and data.right_edge_index.numel() > 0:
+            new_right_edges = data.right_edge_index.to(opt.device)
+            new_right_edge_attr = data.right_edge_attr.to(opt.device)
+        else:
+            new_right_edges, new_right_edge_attr = subgraph(subset=rightBrain.type(torch.long), edge_index=edges, edge_attr=edge_attr)
 
         # First level intra-hemispheric convolutions
         features = F.dropout(features, p=opt.dropout, training=self.training)
@@ -233,6 +242,9 @@ class fc_hgnn(torch.nn.Module):
         self.phonetic_score = phonetic_score
         self.dataloader = dataloader_instance
         self._setup()
+        # Will be filled once and reused to avoid expensive recomputation each epoch
+        self.same_index = None
+        self.diff_index = None
 
     def _setup(self):
         # Initialize individual brain graph and population graph modules
@@ -248,15 +260,26 @@ class fc_hgnn(torch.nn.Module):
             embeddings.append(embedding)
         embeddings = torch.cat(tuple(embeddings))
 
-        # Build heterogeneous population graph edges
-        same_index, diff_index = self.dataloader.get_inputs(self.nonimg, embeddings, self.phonetic_score)
-        same_index = torch.tensor(same_index, dtype=torch.long).to(opt.device)
-        diff_index = torch.tensor(diff_index, dtype=torch.long).to(opt.device)
+        # Build heterogeneous population graph edges (compute once, then reuse)
+        if self.same_index is None or self.diff_index is None:
+            same_index_np, diff_index_np = self.dataloader.get_inputs(self.nonimg, embeddings, self.phonetic_score)
+            self.set_population_edges(same_index_np, diff_index_np)
+
+        same_index = self.same_index
+        diff_index = self.diff_index
 
         # Process population graph for final predictions
         predictions = self.population_graph_model(embeddings, same_index, diff_index)
 
         return predictions
+
+    # ------------------------------------------------------------
+    #   Utilities
+    # ------------------------------------------------------------
+    def set_population_edges(self, same_index_np, diff_index_np):
+        """Cache population graph edges (computed once per fold)."""
+        self.same_index = torch.tensor(same_index_np, dtype=torch.long, device=opt.device)
+        self.diff_index = torch.tensor(diff_index_np, dtype=torch.long, device=opt.device)
 
 class Graph_Transformer(nn.Module):
     # Graph transformer block with multi-head attention and feed-forward network
