@@ -167,8 +167,9 @@ class dataloader():
                     type_matrix[j, i] = 1
 
         type_matrix = torch.from_numpy(type_matrix)
+        device='cuda:0'
         # return type_matrix.to(device) # For CUDA GPUs
-        return type_matrix.to(opt.device) # Use configured device (GPU when available)
+        return type_matrix.to("cpu") # Force CPU usage
 
 def get_subject_score(subject_list, score):
     # Load specific phenotypic scores for given subjects from CSV file
