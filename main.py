@@ -3,6 +3,8 @@
 
 import sys
 import time
+import torch
+import numpy as np
 from opt import *
 from metrics import accuracy, auc, prf, metrics
 from dataload import dataloader
@@ -10,6 +12,7 @@ from model import fc_hgnn
 import os
 from dataload import LabelSmoothingLoss
 from dataload import Logger
+from contextlib import nullcontext
 
 if __name__ == '__main__':
 
@@ -24,6 +27,9 @@ if __name__ == '__main__':
     # Load brain connectivity data and demographics
     dl = dataloader()
     raw_features, y, nonimg, phonetic_score = dl.load_data()
+
+    # Move all graphs to target device once to avoid per-iteration transfers
+    raw_features = [g.to(opt.device, non_blocking=True) for g in raw_features]
 
     # Set up k-fold cross-validation splits
     n_folds = opt.n_folds
@@ -52,6 +58,13 @@ if __name__ == '__main__':
             # Initialize model and labels for current fold
             labels = torch.tensor(y, dtype=torch.long).to(opt.device)
             model = fc_hgnn(nonimg, phonetic_score, dl).to(opt.device)
+
+            # Compile the model if running on PyTorch 2.x for additional speed-ups
+            try:
+                model = torch.compile(model)
+            except Exception as _:
+                # torch.compile not available (<2.0) or other issue – continue without it
+                pass
             print(model)
 
             # Set up loss function (CrossEntropy or Label Smoothing)
@@ -65,14 +78,25 @@ if __name__ == '__main__':
             def train():
                 # Training function for current fold
                 acc = 0
+                # AMP utilities
+                scaler = torch.cuda.amp.GradScaler(enabled=bool(opt.amp))
+                # Use the new torch.amp.autocast API (PyTorch ≥2.1). Fall back to a no-op context when AMP is disabled.
+                autocast_ctx = (lambda: torch.amp.autocast(device_type='cuda')) if bool(opt.amp) else nullcontext
                 for epoch in range(opt.num_iter):
                     # Training phase
                     model.train()
                     optimizer.zero_grad()
-                    with torch.set_grad_enabled(True):
+                    with autocast_ctx():
                         node_logits = model(raw_features)
                         loss_cla = loss_fn(node_logits[train_ind], labels[train_ind])
                         loss = loss_cla
+
+                    # Backward with scaler when AMP enabled
+                    if bool(opt.amp):
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
                         loss.backward()
                         optimizer.step()
                     correct_train, acc_train = accuracy(node_logits[train_ind].detach().cpu().numpy(), y[train_ind])
@@ -80,7 +104,8 @@ if __name__ == '__main__':
                     # Evaluation phase
                     model.eval()
                     with torch.set_grad_enabled(False):
-                        node_logits= model(raw_features)
+                        with autocast_ctx():
+                            node_logits = model(raw_features)
                     logits_test = node_logits[test_ind].detach().cpu().numpy()
                     correct_test, acc_test = accuracy(logits_test, y[test_ind])
                     test_sen, test_spe = metrics(logits_test, y[test_ind])

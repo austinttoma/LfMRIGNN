@@ -22,6 +22,8 @@ class OptInit():
         parser.add_argument('--wd', default=5e-5, type=float, help='weight decay')
         parser.add_argument('--num_iter', default= 100, type=int, help='number of epochs for training')
         parser.add_argument('--dropout', default=0.3, type=float, help='ratio of dropout')
+        parser.add_argument('--batch_size', type=int, default=0, help='batch size for potential mini-batching (0 = full graph)')
+        parser.add_argument('--amp', action='store_true', help='enable automatic mixed precision (AMP)')
         parser.add_argument('--num_classes', type=int, default=3, help='number of classes')
         parser.add_argument('--n_folds', type=int, default=5, help='number of folds')
         
@@ -75,7 +77,8 @@ class OptInit():
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        # Enable fast algorithms (Are non-deterministic)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 

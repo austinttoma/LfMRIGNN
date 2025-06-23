@@ -50,10 +50,17 @@ class Brain_connectomic_graph(torch.nn.Module):
     def forward(self, data):
         # Extract graph components
         edges, features = data.edge_index, data.x
-        edges, features = edges.to(opt.device), features.to(opt.device)
+        # They might already be on the correct device; only move if necessary to avoid
+        # redundant (and costly) memory copies on every forward pass.
+        if edges.device != opt.device:
+            edges = edges.to(opt.device)
+        if features.device != opt.device:
+            features = features.to(opt.device)
 
         edge_attr = data.edge_attr
-        edge_attr = edge_attr.to(opt.device).to(torch.float32)
+        if edge_attr.device != opt.device:
+            edge_attr = edge_attr.to(opt.device)
+        edge_attr = edge_attr.to(torch.float32)
 
         adj=data.adj
         adj=torch.tensor(adj)
