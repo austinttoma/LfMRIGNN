@@ -1,12 +1,17 @@
 import sys
 import time
+import numpy as np
+import torch
+import os
 from opt import *
 from metrics import accuracy, auc, prf, metrics
 from dataload import dataloader
 from model import fc_hgnn
-import os
 from dataload import LabelSmoothingLoss
 from dataload import Logger
+
+# Suppress torch dynamo warnings
+os.environ['TORCHDYNAMO_DISABLE'] = '1'
 
 if __name__ == '__main__':
     # Load preset initial parameters.
@@ -52,7 +57,11 @@ if __name__ == '__main__':
             val_ind = val_index[fold]
             test_ind = test_index[fold]
             # The labels and model in this fold.
-            labels = torch.tensor(y, dtype=torch.long).to(opt.device)
+            # Fix tensor construction warning by using torch.from_numpy for numpy arrays
+            if isinstance(y, np.ndarray):
+                labels = torch.from_numpy(y).to(dtype=torch.long, device=opt.device)
+            else:
+                labels = torch.tensor(y, dtype=torch.long).to(opt.device)
             model = fc_hgnn(nonimg, phonetic_score).to(opt.device)
             print(model)
 

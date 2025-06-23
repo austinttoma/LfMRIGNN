@@ -53,7 +53,7 @@ def prf(preds, labels, is_logit=True):
 	# Calculate Precision, Recall, and F1-score
 	# Returns: [precision, recall, f1_score]
 	pred_lab= np.argmax(preds, 1)  # Get predicted class labels
-	p,r,f,s  = precision_recall_fscore_support(labels, pred_lab, average='macro')
+	p,r,f,s  = precision_recall_fscore_support(labels, pred_lab, average='macro', zero_division=0)
 	return [p,r,f]
 
 

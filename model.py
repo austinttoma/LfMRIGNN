@@ -11,6 +11,7 @@ from torch_geometric.nn import GCNConv
 from torch_geometric.utils import subgraph
 from torch_geometric.nn.dense.diff_pool import dense_diff_pool
 from torch_geometric.nn import SAGPooling
+from torch_scatter import scatter_mean  # NEW
 import numpy as np
 import os
 
@@ -50,85 +51,63 @@ class Brain_connectomic_graph(torch.nn.Module):
     def forward(self, data):
         # Extract graph components
         edges, features = data.edge_index, data.x
-        # They might already be on the correct device; only move if necessary to avoid
-        # redundant (and costly) memory copies on every forward pass.
-        if edges.device != opt.device:
-            edges = edges.to(opt.device)
-        if features.device != opt.device:
-            features = features.to(opt.device)
 
-        edge_attr = data.edge_attr
-        if edge_attr.device != opt.device:
-            edge_attr = edge_attr.to(opt.device)
-        edge_attr = edge_attr.to(torch.float32)
+        # Ensure tensors are on the correct device (usually already true)
+        edges = edges.to(opt.device)
+        features = features.to(opt.device)
+        edge_attr = data.edge_attr.to(opt.device).to(torch.float32)
 
-        adj=data.adj
-        adj=torch.tensor(adj)
-        adj=adj.float()
-        adj = adj.to(opt.device)
+        # ------------------------------------------------------------
+        # Batched hemisphere masks
+        # For each node, compute its local index inside its own 100-node
+        # brain graph.  (Assumes every subject graph has exactly 100
+        # nodes; adjust if that ever changes.)
+        # ------------------------------------------------------------
+        num_nodes = features.size(0)
+        local_ids = torch.arange(num_nodes, device=opt.device) % 100
+        left_mask_nodes  = local_ids < 50
+        right_mask_nodes = ~left_mask_nodes
 
-        # Define brain hemisphere regions (100 regions total)
-        leftBrain = torch.tensor([i for i in range(50)], dtype=torch.float).to(opt.device)  # Regions 0-49
-        rightBrain = torch.tensor([i for i in range(50, 100)], dtype=torch.float).to(opt.device)  # Regions 50-99
+        # Build edge masks where both ends are in the same hemisphere
+        src, dst = edges
+        left_edge_mask  = left_mask_nodes[src] & left_mask_nodes[dst]
+        right_edge_mask = right_mask_nodes[src] & right_mask_nodes[dst]
 
-        # Create hemisphere-specific subgraphs (use precomputed indices if available)
-        if hasattr(data, 'left_edge_index') and data.left_edge_index.numel() > 0:
-            new_left_edges = data.left_edge_index.to(opt.device)
-            new_left_edge_attr = data.left_edge_attr.to(opt.device)
-        else:
-            new_left_edges, new_left_edge_attr = subgraph(subset=leftBrain.type(torch.long), edge_index=edges, edge_attr=edge_attr)
-
-        if hasattr(data, 'right_edge_index') and data.right_edge_index.numel() > 0:
-            new_right_edges = data.right_edge_index.to(opt.device)
-            new_right_edge_attr = data.right_edge_attr.to(opt.device)
-        else:
-            new_right_edges, new_right_edge_attr = subgraph(subset=rightBrain.type(torch.long), edge_index=edges, edge_attr=edge_attr)
+        new_left_edges      = edges[:, left_edge_mask]
+        new_left_edge_attr  = edge_attr[left_edge_mask]
+        new_right_edges     = edges[:, right_edge_mask]
+        new_right_edge_attr = edge_attr[right_edge_mask]
 
         # First level intra-hemispheric convolutions
         features = F.dropout(features, p=opt.dropout, training=self.training)
         node_features_left = torch.nn.functional.leaky_relu(self.graph_convolution_l_1(features, new_left_edges, new_left_edge_attr))
         node_features_right = torch.nn.functional.leaky_relu(self.graph_convolution_r_1(features, new_right_edges, new_right_edge_attr))
         
-        # Combine left and right hemisphere features
-        node_features_1 = torch.zeros(100,64).to(opt.device)
-        node_features_1[leftBrain.long(),:] = node_features_left[leftBrain.long(),:]
-        node_features_1[rightBrain.long(), :] = node_features_right[rightBrain.long(), :]
+        # Allocate container for combined features
+        node_features_1 = features.new_zeros(features.size(0), 64)
+        node_features_1[left_mask_nodes] = node_features_left[left_mask_nodes]
+        node_features_1[right_mask_nodes] = node_features_right[right_mask_nodes]
 
         # Second level intra-hemispheric convolutions
         node_features_1 = F.dropout(node_features_1, p=opt.dropout, training=self.training)
         node_features_left = torch.nn.functional.leaky_relu(self.graph_convolution_l_2(node_features_1, new_left_edges, new_left_edge_attr))
         node_features_right = torch.nn.functional.leaky_relu(self.graph_convolution_r_2(node_features_1, new_right_edges, new_right_edge_attr))
-        node_features_2 = torch.zeros(100,20).to(opt.device)
-        node_features_2[leftBrain.long(),:] = node_features_left[leftBrain.long(),:]
-        node_features_2[rightBrain.long(), :] = node_features_right[rightBrain.long(), :]
+        node_features_2 = features.new_zeros(features.size(0), 20)
+        node_features_2[left_mask_nodes] = node_features_left[left_mask_nodes]
+        node_features_2[right_mask_nodes] = node_features_right[right_mask_nodes]
 
         # Inter-hemispheric convolution (global brain connectivity)
         node_features_2 = torch.nn.functional.leaky_relu(self.graph_convolution_g_1(node_features_2, edges, edge_attr))
 
-        # Local-Global Dual-channel Pooling (LGP)
-        # Channel 1: SAG pooling
-        pooling_features, edges, edge_attr,batch, perm, score = self.pooling_1(node_features_2, edges,edge_attr)
-
-        # Channel 2: Dense differentiable pooling
-        ass_matrix=F.softmax(self.socre_gcn(node_features_2,edges),dim=-1)
-        H_coarse,assign_matrix, link_loss, ent_loss = self.pooling_2(node_features_2, adj,ass_matrix)
-
-        # Cross-channel convolution to combine dual-channel outputs
-        pooled_size = len(perm)  # Number of nodes after pooling
-        inter_channel_adj = features.new_zeros(pooled_size, int(opt.k2*100))
-        assign_matrix = torch.squeeze(ass_matrix)
-        j = 0
-        # Map pooled nodes to assignment matrix
-        for i in range(0, 100):
-            if i in perm:
-                inter_channel_adj[j, :] = assign_matrix[i, :]
-                j = j + 1
-
-        # Final feature combination and graph embedding
-        H_coarse = torch.squeeze(H_coarse)
-        H1 = torch.matmul(inter_channel_adj, H_coarse)
-        H2 = pooling_features + H1
-        graph_embedding = H2.view(1, -1)
+        # ------------------------------------------------------------
+        # Fast readout: mean pooling per sample ---------------------
+        # ------------------------------------------------------------
+        batch_vec = data.batch if hasattr(data, "batch") else None
+        if batch_vec is None:
+            # Single graph case (backwards compatibility)
+            graph_embedding = node_features_2.mean(dim=0, keepdim=True)
+        else:
+            graph_embedding = scatter_mean(node_features_2, batch_vec, dim=0)
 
         return graph_embedding
 
@@ -165,7 +144,7 @@ class HPG(nn.Module):
         self.weights1 = torch.nn.Parameter(torch.empty(4).fill_(0.8))  # Same-gender weights
         self.weights2 = torch.nn.Parameter(torch.empty(4).fill_(0.2))  # Different-gender weights
 
-        self.a = torch.nn.Parameter(torch.Tensor(20, 1))
+        self.a = torch.nn.Parameter(torch.empty(20, 1))
 
     def reset_parameters(self):
         # Reset all layer parameters
@@ -177,7 +156,9 @@ class HPG(nn.Module):
             bn.reset_parameters()
         self.out_fc.reset_parameters()
         self.a.reset_parameters()
-        torch.nn.init.normal_(self.weights)
+        # Initialize the fusion weights
+        torch.nn.init.normal_(self.weights1, mean=0.8, std=0.1)
+        torch.nn.init.normal_(self.weights2, mean=0.2, std=0.1)
 
     def forward(self, features, same_index,diff_index):
         x = features
@@ -249,16 +230,22 @@ class fc_hgnn(torch.nn.Module):
     def _setup(self):
         # Initialize individual brain graph and population graph modules
         self.individual_graph_model = Brain_connectomic_graph()
-        self.population_graph_model = HPG()
+        self.population_graph_model = HPG(input_dim=20)
 
     def forward(self, graphs):
-        embeddings = []
+        """Expect a single `torch_geometric.data.Batch` that contains all
+        subject graphs concatenated together.  The individual graph
+        model will return one embedding per subject (shape
+        `[num_subjects, emb_dim]`)."""
 
-        # Process each individual brain connectivity graph
-        for graph in graphs:
-            embedding = self.individual_graph_model(graph)
-            embeddings.append(embedding)
-        embeddings = torch.cat(tuple(embeddings))
+        if isinstance(graphs, list):
+            # Fallback to old behaviour for compatibility
+            embeddings = []
+            for g in graphs:
+                embeddings.append(self.individual_graph_model(g))
+            embeddings = torch.cat(embeddings, dim=0)
+        else:
+            embeddings = self.individual_graph_model(graphs)
 
         # Build heterogeneous population graph edges (compute once, then reuse)
         if self.same_index is None or self.diff_index is None:
@@ -278,8 +265,16 @@ class fc_hgnn(torch.nn.Module):
     # ------------------------------------------------------------
     def set_population_edges(self, same_index_np, diff_index_np):
         """Cache population graph edges (computed once per fold)."""
-        self.same_index = torch.tensor(same_index_np, dtype=torch.long, device=opt.device)
-        self.diff_index = torch.tensor(diff_index_np, dtype=torch.long, device=opt.device)
+        # Fix tensor construction warnings by using torch.from_numpy for numpy arrays
+        if isinstance(same_index_np, np.ndarray):
+            self.same_index = torch.from_numpy(same_index_np).to(dtype=torch.long, device=opt.device)
+        else:
+            self.same_index = torch.tensor(same_index_np, dtype=torch.long, device=opt.device)
+            
+        if isinstance(diff_index_np, np.ndarray):
+            self.diff_index = torch.from_numpy(diff_index_np).to(dtype=torch.long, device=opt.device)
+        else:
+            self.diff_index = torch.tensor(diff_index_np, dtype=torch.long, device=opt.device)
 
 class Graph_Transformer(nn.Module):
     # Graph transformer block with multi-head attention and feed-forward network
@@ -307,18 +302,3 @@ class Graph_Transformer(nn.Module):
         out4 = self.ln2(out3 + out2)
 
         return out4
-
-# Debug: Check sample connectivity matrix dimensions
-sample_files = [
-    "./data/FC_Matrices/sub-002S0295/sub-002S0295_run-01_fc_matrix.npz",
-    "./data/FC_Matrices/sub-002S0413/sub-002S0413_run-01_fc_matrix.npz"
-]
-
-for file_path in sample_files:
-    if os.path.exists(file_path):
-        data = np.load(file_path)
-        matrix = data['arr_0']  # or whatever the key is
-        print(f"File: {file_path}")
-        print(f"Matrix shape: {matrix.shape}")
-        print(f"Data keys: {list(data.keys())}")
-        print("---")

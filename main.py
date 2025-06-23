@@ -5,14 +5,18 @@ import sys
 import time
 import torch
 import numpy as np
+import os
 from opt import *
 from metrics import accuracy, auc, prf, metrics
 from dataload import dataloader
 from model import fc_hgnn
-import os
 from dataload import LabelSmoothingLoss
 from dataload import Logger
 from contextlib import nullcontext
+from torch_geometric.data import Batch  # NEW
+
+# Suppress torch dynamo warnings
+os.environ['TORCHDYNAMO_DISABLE'] = '1'
 
 if __name__ == '__main__':
 
@@ -28,8 +32,8 @@ if __name__ == '__main__':
     dl = dataloader()
     raw_features, y, nonimg, phonetic_score = dl.load_data()
 
-    # Move all graphs to target device once to avoid per-iteration transfers
-    raw_features = [g.to(opt.device, non_blocking=True) for g in raw_features]
+    # Batch all subject graphs into a single PyG Batch for fast processing
+    batched_graph = Batch.from_data_list(raw_features).to(opt.device, non_blocking=True)
 
     # Set up k-fold cross-validation splits
     n_folds = opt.n_folds
@@ -56,19 +60,30 @@ if __name__ == '__main__':
             test_ind = cv_splits[fold][1]
 
             # Initialize model and labels for current fold
-            labels = torch.tensor(y, dtype=torch.long).to(opt.device)
+            # Fix tensor construction warning by using torch.from_numpy for numpy arrays
+            if isinstance(y, np.ndarray):
+                labels = torch.from_numpy(y).to(dtype=torch.long, device=opt.device)
+            else:
+                labels = torch.tensor(y, dtype=torch.long).to(opt.device)
             model = fc_hgnn(nonimg, phonetic_score, dl).to(opt.device)
 
             # Pre-compute population graph edges once (does not depend on embeddings)
             same_idx_np, diff_idx_np = dl.get_inputs(nonimg, torch.zeros((len(raw_features), 1)), phonetic_score)
             model.set_population_edges(same_idx_np, diff_idx_np)
 
-            # Compile the model if running on PyTorch 2.x for additional speed-ups
-            try:
-                model = torch.compile(model)
-            except Exception as _:
-                # torch.compile not available (<2.0) or other issue – continue without it
-                pass
+            # ------------------------------------------------------------------
+            # Optional graph compilation (PyTorch ≥ 2.0)
+            # Using mode="reduce-overhead" tends to pay off for models dominated
+            # by many small kernel launches while keeping compile time modest.
+            # If anything goes wrong we silently fall back to eager execution.
+            # ------------------------------------------------------------------
+            if hasattr(torch, "compile"):
+                try:
+                    model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+                    print("[torch.compile] Enabled graph mode for extra speed-ups")
+                except Exception as compile_err:
+                    print(f"[torch.compile] Disabled – reason: {compile_err}")
+
             print(model)
 
             # Set up loss function (CrossEntropy or Label Smoothing)
@@ -82,8 +97,8 @@ if __name__ == '__main__':
             def train():
                 # Training function for current fold
                 acc = 0
-                # AMP utilities
-                scaler = torch.cuda.amp.GradScaler(enabled=bool(opt.amp))
+                # AMP utilities - Updated to use torch.amp.GradScaler
+                scaler = torch.amp.GradScaler(enabled=bool(opt.amp))
                 # Use the new torch.amp.autocast API (PyTorch ≥2.1). Fall back to a no-op context when AMP is disabled.
                 autocast_ctx = (lambda: torch.amp.autocast(device_type='cuda')) if bool(opt.amp) else nullcontext
                 for epoch in range(opt.num_iter):
@@ -91,7 +106,7 @@ if __name__ == '__main__':
                     model.train()
                     optimizer.zero_grad()
                     with autocast_ctx():
-                        node_logits = model(raw_features)
+                        node_logits = model(batched_graph)
                         loss_cla = loss_fn(node_logits[train_ind], labels[train_ind])
                         loss = loss_cla
 
@@ -109,7 +124,7 @@ if __name__ == '__main__':
                     model.eval()
                     with torch.set_grad_enabled(False):
                         with autocast_ctx():
-                            node_logits = model(raw_features)
+                            node_logits = model(batched_graph)
                     logits_test = node_logits[test_ind].detach().cpu().numpy()
                     correct_test, acc_test = accuracy(logits_test, y[test_ind])
                     test_sen, test_spe = metrics(logits_test, y[test_ind])
@@ -145,7 +160,7 @@ if __name__ == '__main__':
                 print('  Start testing...')
                 model.load_state_dict(torch.load(fold_model_path))
                 model.eval()
-                node_logits = model(raw_features)
+                node_logits = model(batched_graph)
                 logits_test = node_logits[test_ind].detach().cpu().numpy()
                 corrects[fold], accs[fold] = accuracy(logits_test, y[test_ind])
                 sens[fold], spes[fold] = metrics(logits_test, y[test_ind])
