@@ -61,8 +61,8 @@ class Brain_connectomic_graph(torch.nn.Module):
         adj = adj.to(opt.device)
 
         # Define brain hemisphere regions (100 regions total)
-        leftBrain = torch.tensor([i for i in range(50)], dtype=torch.float)  # Regions 0-49
-        rightBrain = torch.tensor([i for i in range(50, 100)], dtype=torch.float)  # Regions 50-99
+        leftBrain = torch.tensor([i for i in range(50)], dtype=torch.float).to(opt.device)  # Regions 0-49
+        rightBrain = torch.tensor([i for i in range(50, 100)], dtype=torch.float).to(opt.device)  # Regions 50-99
 
         # Create hemisphere-specific subgraphs
         new_left_edges,new_left_edge_attr = subgraph(subset=leftBrain.type(torch.long),edge_index=edges,edge_attr=edge_attr)
