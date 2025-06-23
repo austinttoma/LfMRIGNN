@@ -63,7 +63,7 @@ if __name__ == '__main__':
             # loss_fn =LabelSmoothingLoss()
 
             optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.wd)
-            fold_model_path = opt.ckpt_path + r"\inffus_fold{}.pth".format(fold)
+            fold_model_path = os.path.join(opt.ckpt_path, "inffus_fold{}.pth".format(fold))
 
 
             # The train function.
